@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "c-interactive-kernel"
+version = "3.0.0"
+description = "Jupyter kernel for C: scanf input, binary input, values of variables without printf, gdb"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.9"
+dependencies = ["ipykernel>=6.20"]
+
+[tool.setuptools]
+packages = ["c_interactive_kernel", "c_interactive_kernel.resources"]
+
+[tool.setuptools.package-data]
+"c_interactive_kernel.resources" = ["*.c"]
