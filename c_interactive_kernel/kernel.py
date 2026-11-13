@@ -15,6 +15,8 @@ Added on top of it:
     line //%line: N (default: the end of main); one cell may have several //%line parts.
     Statements are pasted into the program and run, lines that are bare expressions
     (N, Numbers[0:N], Items[0:N].Key, Point.X, *Head) are shown through gdb;
+  - //%debug: 21 35 prepares the program for the VS Code debugger (F5, "C: отладка ячейки"):
+    breakpoints, variables, watch and steps in the usual VS Code interface;
   - the Stop button stops the program, errors mark the cell as failed (Run All stops there).
 """
 
@@ -99,7 +101,7 @@ class CellFailed(Exception):
 
 class CKernel(Kernel):
     implementation = 'c_interactive_kernel'
-    implementation_version = '3.1'
+    implementation_version = '3.2'
     language = 'c'
     language_version = 'C17'
     language_info = {'name': 'c',
@@ -209,7 +211,7 @@ class CKernel(Kernel):
     def _parse(self, code):
         """Settings and inputs written in the cell as //%key: value lines and /*%name ... */ blocks"""
         cell = {'cflags': [], 'ldflags': [], 'args': [], 'out': 'text', 'width': 0, 'gdb': None,
-                'lines': [], 'test': 1, 'time': False}
+                'lines': [], 'test': 1, 'time': False, 'debug': None}
         inputs = []  # (position in the cell, bytes): the program runs once per input, in this order
 
         for block in re.finditer(r'/\*%(input|bytes|gdb)[ \t]*\n(.*?)\*/', code, re.DOTALL):
@@ -239,6 +241,8 @@ class CKernel(Kernel):
                 cell['lines'].append((code.count('\n', 0, line.start()), int(value)))  # (line of the cell, line of the program)
             elif key == 'test':
                 cell['test'] = int(value)
+            elif key == 'debug':
+                cell['debug'] = [int(number) for number in re.findall(r'\d+', value)]
             elif key == 'time':
                 cell['time'] = True
             elif key == 'out':
@@ -591,8 +595,82 @@ class CKernel(Kernel):
                                 cwd=self.work, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return result.returncode == 0
 
+    def _vscode_debug(self, cell, code):
+        """Build the program with -g into a fixed folder and add the "C: отладка ячейки" configuration
+        to .vscode/launch.json of the notebook folder: F5 then runs it in the VS Code debugger"""
+        self._need_gdb()
+        folder = os.path.join(os.path.expanduser('~'), '.cache', 'c-interactive-kernel', 'debug')
+        os.makedirs(folder, exist_ok=True)
+        source = self._with_definitions(code)
+        for name, text in dict(self.files, **{'build.c': source}).items():
+            with open(os.path.join(folder, name), 'w') as file:
+                file.write(text)
+        inputs = cell['inputs'] or [b'']
+        test = min(cell['test'], len(inputs))
+        with open(os.path.join(folder, 'input.txt'), 'wb') as file:
+            file.write(inputs[test - 1] or b'')
+        lines = cell['debug']
+        with open(os.path.join(folder, 'start.gdb'), 'w') as file:
+            file.write('set breakpoint pending on\n' + ''.join('break cell.c:{}\n'.format(line) for line in lines or [])
+                       + ('' if lines else 'break main\n'))
+        built = subprocess.run(['gcc', '-g', '-O0', '-w'] + cell['cflags'] + ['build.c', '-o', 'cell', '-lm'] + cell['ldflags'],
+                               cwd=folder, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        if built.returncode != 0:
+            self._write_to_stderr(built.stdout.decode('utf-8', 'replace'))
+            raise CellFailed('ошибка компиляции')
+        self._add_launch_configuration(folder)
+        where = ('на строке ' if len(lines or []) == 1 else 'на строках ') + ', '.join(str(line) for line in lines) if lines else 'в начале main'
+        self._write_to_stdout('[отладка в VS Code готова: F5 -> «C: отладка ячейки», тест {}, остановка {}]\n'.format(test, where))
+        extensions = os.path.join(os.path.expanduser('~'), '.vscode-server', 'extensions')
+        if os.path.isdir(extensions) and not any(name.startswith('ms-vscode.cpptools') for name in os.listdir(extensions)):
+            self._write_to_stderr('[C kernel] для F5 нужно расширение VS Code «C/C++» (ms-vscode.cpptools)\n')
+
+    @staticmethod
+    def _add_launch_configuration(folder):
+        """Add our configuration to .vscode/launch.json once; the file may have comments, so it is edited as text"""
+        configuration = {
+            'name': 'C: отладка ячейки',
+            'type': 'cppdbg',
+            'request': 'launch',
+            'program': os.path.join(folder, 'cell'),
+            'args': ['<', os.path.join(folder, 'input.txt')],
+            'cwd': os.getcwd(),
+            'MIMode': 'gdb',
+            'miDebuggerPath': shutil.which('gdb'),
+            'externalConsole': False,
+            'setupCommands': [{'text': '-enable-pretty-printing', 'ignoreFailures': True},
+                              {'text': 'source ' + os.path.join(folder, 'start.gdb')}],
+        }
+        path = os.path.join(os.getcwd(), '.vscode', 'launch.json')
+        text = json.dumps(configuration, ensure_ascii=False, indent=4)
+        if not os.path.exists(path):
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, 'w') as file:
+                file.write('{\n    "version": "0.2.0",\n    "configurations": [\n' + re.sub('(?m)^', '        ', text) + '\n    ]\n}\n')
+            return
+        with open(path) as file:
+            old = file.read()
+        if '"C: отладка ячейки"' in old:
+            return
+        start = re.search(r'"configurations"\s*:\s*\[\s*', old)
+        if start is None:
+            raise CellFailed('в .vscode/launch.json нет "configurations", добавьте туда:\n' + text)
+        empty = old[start.end():start.end() + 1] == ']'
+        new = old[:start.start()] + '"configurations": [\n        ' + re.sub('(?m)^', '        ', text).lstrip() \
+            + ('\n    ' if empty else ',\n        ') + old[start.end():]
+        with open(path, 'w') as file:
+            file.write(new)
+
     def _execute(self, code, allow_stdin):
         cell = self._parse(code)
+
+        if not self._without_comments(code).strip() and cell['debug'] is not None:  # only //%debug: debug the last program
+            if self.program is None:
+                self._write_to_stderr('[C kernel] сначала запустите ячейку с программой\n')
+                raise CellFailed('нет программы')
+            self._vscode_debug(dict(self.program['cell'], debug=cell['debug'], test=cell['test'],
+                                    inputs=cell['inputs'] or self.program['cell']['inputs']), self.program['code'])
+            return
 
         if not self._without_comments(code).strip() and cell['gdb'] is not None:  # only a /*%gdb*/ block: debug the last program
             if self.program is None:
@@ -614,6 +692,8 @@ class CKernel(Kernel):
             return
 
         self.program = {'code': code, 'cell': cell}
+        if cell['debug'] is not None:
+            self._vscode_debug(cell, code)
         if cell['gdb'] is not None:
             self._debug(cell, code)
             return
