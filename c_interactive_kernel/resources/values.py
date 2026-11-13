@@ -1,11 +1,13 @@
 """
-gdb script for debug cells: stops the program at a line and evaluates expressions there.
+gdb script for debug cells: stops the program at lines and evaluates expressions there.
 
 Run as: gdb -q -batch -x values.py --args ./cell ...
 Reads values_in.json from the current directory:
-  {"line": N, "expressions": [[label, gdb expression], ...], "limit": 20}
+  {"groups": [{"line": N, "expressions": [[label, spec], ...]}, ...], "limit": 20}
+  spec is {"expression": gdb expression} or, for a slice with a field like A[0:N].Key,
+  {"base": "A", "start": "0", "end": "N", "suffix": ".Key"}
 Writes values_out.json:
-  {"passes": [[[label, text], ...], ...], "more": bool, "crash": null or {...}, "error": null or text}
+  {"groups": [{"passes": [[[label, text], ...], ...], "more": bool}, ...], "crash": null or {...}, "error": null or text}
 The program reads input.txt and writes its output to out.txt.
 """
 
@@ -25,15 +27,16 @@ for command in ('set pagination off', 'set confirm off', 'set print pretty on', 
     except gdb.error:
         pass
 
-result = {'passes': [], 'more': False, 'crash': None, 'error': None}
+result = {'groups': [{'passes': [], 'more': False} for _ in settings['groups']], 'crash': None, 'error': None}
 state = {'stop': None, 'exited': False}
+SHOWN_ELEMENTS = 200
 
 
 def on_stop(event):
     if isinstance(event, gdb.SignalEvent):
         state['stop'] = ('signal', event.stop_signal)
     elif isinstance(event, gdb.BreakpointEvent):
-        state['stop'] = ('break', None)
+        state['stop'] = ('break', [breakpoint.number for breakpoint in event.breakpoints])
 
 
 def on_exit(event):
@@ -47,14 +50,16 @@ gdb.events.exited.connect(on_exit)
 def translate(message):
     if message.startswith('No symbol "') and message.endswith('" in current context.'):
         return 'нет переменной {} в этом месте программы'.format(message[len('No symbol "'):-len('" in current context.')])
+    if message.startswith('There is no member named '):
+        return 'в структуре нет поля ' + message[len('There is no member named '):].rstrip('.')
     if message.startswith('Cannot access memory at address'):
         return 'чужая память по адресу' + message[len('Cannot access memory at address'):]
     return message
 
 
 def show(label, value):
-    text = value.format_string(pretty_structs=True)
     kind = value.type.strip_typedefs()
+    text = value.format_string(pretty_structs=kind.code != gdb.TYPE_CODE_ARRAY)  # an array of structs fits in one line
     if kind.code == gdb.TYPE_CODE_PTR:
         target = kind.target().strip_typedefs()
         is_string = target.code == gdb.TYPE_CODE_INT and target.sizeof == 1
@@ -63,13 +68,26 @@ def show(label, value):
     return text
 
 
-def values():
+def evaluate(label, spec):
+    """The text of one expression; a slice with a field, A[0:N].Key, shows the field of every element"""
+    if 'expression' in spec:
+        return show(label, gdb.parse_and_eval(spec['expression']))
+    count = int(gdb.parse_and_eval('({}) - ({})'.format(spec['end'], spec['start'])))
+    parts = []
+    for index in range(max(0, min(count, SHOWN_ELEMENTS))):
+        element = gdb.parse_and_eval('({})[({}) + {}]{}'.format(spec['base'], spec['start'], index, spec['suffix']))
+        parts.append(element.format_string(pretty_structs=False))
+    return '{' + ', '.join(parts) + (', ...' if count > SHOWN_ELEMENTS else '') + '}'
+
+
+def values(expressions, quiet=False):
     shown = []
-    for label, expression in settings['expressions']:
+    for label, spec in expressions:
         try:
-            shown.append([label, show(label, gdb.parse_and_eval(expression))])
+            shown.append([label, evaluate(label, spec)])
         except gdb.error as error:
-            shown.append([label, '!' + translate(str(error))])
+            if not quiet:
+                shown.append([label, '!' + translate(str(error))])
     return shown
 
 
@@ -124,8 +142,12 @@ def local_values(frame):
 
 
 try:
-    if settings['line'] is not None:
-        gdb.execute('break cell.c:{}'.format(settings['line']), to_string=True)
+    owners = {}  # breakpoint number -> index of the group that stops there
+    for index, group in enumerate(settings['groups']):
+        owners[gdb.Breakpoint('cell.c:{}'.format(group['line'])).number] = index
+    every_expression = []  # for the crash: every expression of the cell, each once
+    for group in settings['groups']:
+        every_expression += [item for item in group['expressions'] if item[0] not in [known[0] for known in every_expression]]
     command = 'run < input.txt > out.txt'
     while True:
         state['stop'] = None
@@ -139,14 +161,21 @@ try:
                      'stack': stack(), 'locals': []}
             if frame is not None:
                 frame.select()
-                crash.update(file=file_name(place), line=place.line, function=frame.name(), values=values(),
-                             locals=local_values(frame))
+                crash.update(file=file_name(place), line=place.line, function=frame.name(),
+                             values=values(every_expression, quiet=True), locals=local_values(frame))
             result['crash'] = crash
             break
-        if len(result['passes']) >= settings['limit']:
-            result['more'] = True
+        for number in state['stop'][1]:
+            if number not in owners:
+                continue
+            group = result['groups'][owners[number]]
+            if len(group['passes']) >= settings['limit']:
+                group['more'] = True
+                gdb.breakpoints()[[breakpoint.number for breakpoint in gdb.breakpoints()].index(number)].enabled = False
+            else:
+                group['passes'].append(values(settings['groups'][owners[number]]['expressions']))
+        if not any(breakpoint.enabled for breakpoint in gdb.breakpoints()):
             break
-        result['passes'].append(values())
 except gdb.error as error:
     result['error'] = str(error)
 

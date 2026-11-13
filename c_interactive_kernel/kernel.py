@@ -12,8 +12,9 @@ Added on top of it:
   - a cell without main() that only defines things (functions, structs, globals, #include)
     is remembered and added to every later program, like a def cell in a Python notebook;
   - any other cell without main() is a debug cell: it works inside the last program before
-    line //%line: N (default: the end of main). Statements are pasted into the program and run,
-    lines that are bare expressions (N, Numbers[0:N], Point.X, *Head) are shown through gdb;
+    line //%line: N (default: the end of main); one cell may have several //%line parts.
+    Statements are pasted into the program and run, lines that are bare expressions
+    (N, Numbers[0:N], Items[0:N].Key, Point.X, *Head) are shown through gdb;
   - the Stop button stops the program, errors mark the cell as failed (Run All stops there).
 """
 
@@ -33,8 +34,9 @@ import tempfile
 import termios
 import time
 
-START_MARK = b'\x02snippet\x02'  # a debug cell prints these around its output, so the program's own output can be dropped
-END_MARK = b'\x03snippet\x03'
+START_MARK = b'\x02snippet{}\x02'  # a debug cell prints these around its output (with the number of its part),
+END_MARK = b'\x03snippet\x03'  # so the program's own output can be dropped
+SNIPPET = re.compile(rb'\x02snippet(\d+)\x02(.*?)(?=\x03snippet\x03|\x02snippet\d+\x02|\Z)', re.DOTALL)
 SHOWN_PASSES = 20
 RESOURCES = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'resources')
 SIGNALS = {11: 'SIGSEGV, обращение к чужой памяти', 8: 'SIGFPE, деление на ноль', 6: 'SIGABRT, аварийная остановка'}
@@ -97,7 +99,7 @@ class CellFailed(Exception):
 
 class CKernel(Kernel):
     implementation = 'c_interactive_kernel'
-    implementation_version = '3.0'
+    implementation_version = '3.1'
     language = 'c'
     language_version = 'C17'
     language_info = {'name': 'c',
@@ -149,19 +151,40 @@ class CKernel(Kernel):
 
     @staticmethod
     def _split_snippet(data):
-        """What the debug cell printed: the text between its markers, one part per pass"""
-        parts = []
-        for part in bytes(data).split(START_MARK)[1:]:
-            text = part.split(END_MARK)[0].decode('utf-8', 'replace')
-            parts.append(text if not text or text.endswith('\n') else text + '\n')
+        """What each part of the debug cell printed: part number -> texts, one per pass"""
+        parts = {}
+        for match in SNIPPET.finditer(bytes(data)):
+            text = match.group(2).decode('utf-8', 'replace')
+            parts.setdefault(int(match.group(1)), []).append(text if not text or text.endswith('\n') else text + '\n')
         return parts
+
+    @staticmethod
+    def _value_lines(shown):
+        text = ''
+        for label, value in shown:
+            text += '{}: {}\n'.format(label, value[1:]) if value.startswith('!') else '{} = {}\n'.format(label, value)
+        return text
+
+    def _format_groups(self, groups, test, printed, result=None):
+        """Output of a debug cell: for every //%line part its header, then what it printed and showed"""
+        text = ''
+        for index, group in enumerate(groups):
+            own = printed.get(index, [])
+            more = False
+            if result is not None:
+                passes = result['groups'][index]['passes']
+                more = result['groups'][index]['more']
+                own = [(own[number] if number < len(own) else '') + self._value_lines(shown) for number, shown in enumerate(passes)]
+            text += '[строка {} программы, тест {}]\n'.format(group['number'], test)
+            if own:
+                text += self._passes(own, more)
+            elif result is None or not result['crash']:
+                text += '(эта строка ни разу не выполнилась)\n'
+        return text
 
     @staticmethod
     def _format_output(data, mode, width):
         """Binary output: hex bytes, 4-byte little-endian ints or bytes with printable characters"""
-        if mode == 'snippet':
-            parts = CKernel._split_snippet(data)
-            return CKernel._passes(parts) if parts else '(эта строка ни разу не выполнилась)\n'
         if not data:
             return '(пусто)\n'
         lines = []
@@ -186,7 +209,7 @@ class CKernel(Kernel):
     def _parse(self, code):
         """Settings and inputs written in the cell as //%key: value lines and /*%name ... */ blocks"""
         cell = {'cflags': [], 'ldflags': [], 'args': [], 'out': 'text', 'width': 0, 'gdb': None,
-                'line': None, 'test': 1, 'time': False}
+                'lines': [], 'test': 1, 'time': False}
         inputs = []  # (position in the cell, bytes): the program runs once per input, in this order
 
         for block in re.finditer(r'/\*%(input|bytes|gdb)[ \t]*\n(.*?)\*/', code, re.DOTALL):
@@ -212,8 +235,10 @@ class CKernel(Kernel):
                         inputs.append((line.start(), file.read()))
                 except OSError as error:
                     self._write_to_stderr('[C kernel] cannot read input file: {}\n'.format(error))
-            elif key in ('line', 'test'):
-                cell[key] = int(value)
+            elif key == 'line':
+                cell['lines'].append((code.count('\n', 0, line.start()), int(value)))  # (line of the cell, line of the program)
+            elif key == 'test':
+                cell['test'] = int(value)
             elif key == 'time':
                 cell['time'] = True
             elif key == 'out':
@@ -249,31 +274,40 @@ class CKernel(Kernel):
 
     @staticmethod
     def _to_gdb(expression):
-        """Slices like in Python: A[2:5] -> A[2]@3, A[:N] -> A[0]@N"""
-        def slice_(match):
-            start = match.group(2).strip() or '0'
-            return '({0})[{1}]@(({2}) - ({1}))'.format(match.group(1), start, match.group(3).strip())
-        return re.sub(r'^(.*?)\[([^\[\]:]*):([^\[\]:]+)\]$', slice_, expression)
+        """Slices like in Python: A[2:5] -> A[2]@3, A[:N] -> A[0]@N; A[0:N].Key -> the field of every element"""
+        match = re.match(r'^(.*?)\[([^\[\]:]*):([^\[\]:]+)\]((?:\.|->|\[).*)?$', expression)
+        if match is None:
+            return {'expression': expression}
+        base, start, end, suffix = match.group(1), match.group(2).strip() or '0', match.group(3).strip(), match.group(4)
+        if suffix:
+            return {'base': base, 'start': start, 'end': end, 'suffix': suffix}
+        return {'expression': '({0})[{1}]@(({2}) - ({1}))'.format(base, start, end)}
 
-    def _classify(self, code):
-        """Split a debug cell into statements (pasted into the program) and bare expressions (shown by gdb)"""
+    def _classify(self, code, marks):
+        """Split a debug cell into parts, one per //%line (marks: [(line of the cell, line of the program)]).
+        In every part: statements (pasted into the program) and bare expressions (shown by gdb)"""
         clean = self._without_comments(code).split('\n')
-        statements = code.split('\n')
-        expressions = []
+        starts = dict(marks)
+        groups = [{'line': None, 'statements': [], 'expressions': []}]
         depth, body_expected = 0, False
         for index, line in enumerate(clean):
+            if index in starts:
+                groups.append({'line': starts[index], 'statements': [], 'expressions': []})
             text = line.strip()
             if not text:
                 continue
             if depth == 0 and not body_expected and not text.startswith('#') and not CONTROL.match(text) \
                     and text[-1] not in ';{}' and text.count('(') == text.count(')'):
-                expressions += self._split_expressions(code.split('\n')[index].strip() if '"' in text else text)
-                statements[index] = ''
+                groups[-1]['expressions'] += self._split_expressions(code.split('\n')[index].strip() if '"' in text else text)
                 continue
+            groups[-1]['statements'].append(index)
             depth += text.count('{') - text.count('}')
             header = depth == 0 and CONTROL.match(text) is not None and text[-1] not in ';{}'
             body_expected = header or body_expected and text[-1] not in ';{}'
-        return '\n'.join(statements), expressions
+        lines = code.split('\n')
+        for group in groups:  # only the part's own lines stay, the rest are blank: errors keep the cell's line numbers
+            group['statements'] = '\n'.join(line if index in group['statements'] else '' for index, line in enumerate(lines))
+        return [group for group in groups if group['expressions'] or group['statements'].strip()]
 
     # ---------- building the source ----------
 
@@ -290,15 +324,23 @@ class CKernel(Kernel):
         return '\n'.join(parts + ['#line 1 "cell.c"', code]) + '\n'
 
     @staticmethod
-    def _paste(code, snippet, number):
-        """Paste the debug cell into the program before line number"""
+    def _paste(code, groups):
+        """Paste the statements of every part into the program before its line; the lowest lines go first,
+        so the line numbers above each place do not move"""
         lines = code.split('\n')
-        start = '{{ fflush(stdout); fwrite("{0}", 1, {1}, stdout);'.format(
-            ''.join('\\x{:02x}'.format(byte) for byte in START_MARK), len(START_MARK))
-        end = '; fflush(stdout); fwrite("{0}", 1, {1}, stdout); fflush(stdout); }}'.format(
-            ''.join('\\x{:02x}'.format(byte) for byte in END_MARK), len(END_MARK))
-        pasted = ['#line 1 "snippet"', start, '#line 1 "snippet"', snippet, end, '#line {} "cell.c"'.format(number)]
-        return '\n'.join(lines[:number - 1] + pasted + lines[number - 1:])
+        for index in sorted(range(len(groups)), key=lambda index: (groups[index]['number'], index), reverse=True):
+            if not CKernel._without_comments(groups[index]['statements']).strip():
+                continue
+            mark = START_MARK.replace(b'{}', str(index).encode())
+            start = '{{ fflush(stdout); fwrite("{0}", 1, {1}, stdout);'.format(
+                ''.join('\\x{:02x}'.format(byte) for byte in mark), len(mark))
+            end = '; fflush(stdout); fwrite("{0}", 1, {1}, stdout); fflush(stdout); }}'.format(
+                ''.join('\\x{:02x}'.format(byte) for byte in END_MARK), len(END_MARK))
+            number = groups[index]['number']
+            pasted = ['#line 1 "snippet"', start, '#line 1 "snippet"', groups[index]['statements'], end,
+                      '#line {} "cell.c"'.format(number)]
+            lines = lines[:number - 1] + pasted + lines[number - 1:]
+        return '\n'.join(lines)
 
     @staticmethod
     def _default_line(code):
@@ -390,7 +432,7 @@ class CKernel(Kernel):
         spent = time.perf_counter() - began
 
         if collected is not None:
-            self._write_to_stdout(self._format_output(collected, cell['out'], cell['width']))
+            self._write_to_stdout(cell['format'](collected) if 'format' in cell else self._format_output(collected, cell['out'], cell['width']))
         if cell['time']:
             self._write_to_stdout('[время: {:.3f} с]\n'.format(spent))
         if process.returncode in (-signal.SIGINT, -signal.SIGKILL):
@@ -447,48 +489,38 @@ class CKernel(Kernel):
         text = self._gdb(cmd + ['--args', './cell'] + cell['args'])
         self._write_to_stdout('\n'.join(line for line in text.splitlines() if 'libthread_db' not in line) + '\n')
 
-    def _show_values(self, run, expressions, number, given):
-        """Stop the program at line number under gdb and show the expressions on every pass"""
+    def _show_values(self, run, groups, test, given):
+        """Stop the program at the line of every part under gdb and show its expressions on every pass"""
         self._need_gdb()
-        result = self._gdb_values(run, number, expressions, given)
+        result = self._gdb_values(run, groups, given)
         try:
             with open(os.path.join(self.work, 'out.txt'), 'rb') as file:
                 printed = self._split_snippet(file.read())
         except OSError:
-            printed = []
-
-        def lines(shown):
-            text = ''
-            for label, value in shown:
-                text += '{}: {}\n'.format(label, value[1:]) if value.startswith('!') else '{} = {}\n'.format(label, value)
-            return text
-
-        passes = [(printed[index] if index < len(printed) else '') + lines(shown) for index, shown in enumerate(result['passes'])]
-        if passes:
-            self._write_to_stdout(self._passes(passes, result['more']))
-        elif not result['crash']:
-            self._write_to_stdout('(эта строка ни разу не выполнилась)\n')
+            printed = {}
+        self._write_to_stdout(self._format_groups(groups, test, printed, result))
         crash = result['crash']
-        failed = [value for shown in result['passes'] for _, value in shown if value.startswith('!')]
+        failed = [value for group in result['groups'] for shown in group['passes'] for _, value in shown if value.startswith('!')]
         if failed and not crash:
             raise CellFailed(failed[0][1:])
         if crash:
             reason = GDB_SIGNALS.get(crash['signal'], crash['signal'])
             self._write_to_stderr('[C kernel] программа упала: {}\n'.format(reason))
             if crash['values']:
-                self._write_to_stdout('значения в момент падения:\n' + lines(crash['values']))
+                self._write_to_stdout('значения в момент падения:\n' + self._value_lines(crash['values']))
             self._write_to_stderr(self._describe_crash(crash))
             raise CellFailed(reason)
 
-    def _gdb_values(self, run, line, expressions, given):
-        """Run values.py in gdb: stop at line (or nowhere), show expressions; returns its result"""
+    def _gdb_values(self, run, groups, given):
+        """Run values.py in gdb: stop at the line of every part, show its expressions; returns its result"""
         self._write_input(given)
         for name in ('out.txt', 'values_out.json'):
             if os.path.exists(os.path.join(self.work, name)):
                 os.remove(os.path.join(self.work, name))
         with open(os.path.join(self.work, 'values_in.json'), 'w') as file:
-            json.dump({'line': line, 'limit': SHOWN_PASSES,
-                       'expressions': [[expression, self._to_gdb(expression)] for expression in expressions]}, file)
+            json.dump({'limit': SHOWN_PASSES, 'groups': [
+                {'line': group['number'], 'expressions': [[expression, self._to_gdb(expression)] for expression in group['expressions']]}
+                for group in groups]}, file)
         log = self._gdb(['gdb', '-q', '-batch', '-x', os.path.join(RESOURCES, 'values.py'), '--args', './cell'] + run['args'])
         try:
             with open(os.path.join(self.work, 'values_out.json')) as file:
@@ -521,7 +553,7 @@ class CKernel(Kernel):
         """The program crashed: run it again under gdb with the same input to find the line"""
         try:
             self._build_executable(cell, self._with_definitions(code), '-w')
-            result = self._gdb_values(cell, None, [], given)
+            result = self._gdb_values(cell, [], given)
         except CellFailed:
             return
         if result['crash']:
@@ -534,20 +566,22 @@ class CKernel(Kernel):
                                   'потом эта ячейка будет работать внутри неё\n')
             raise CellFailed('нет программы')
         program = self.program
-        number = cell['line'] or self._default_line(program['code'])
-        statements, expressions = self._classify(code)
+        groups = self._classify(code, cell['lines'])
+        for group in groups:
+            group['number'] = group['line'] or self._default_line(program['code'])
         inputs = cell['inputs'] or program['cell']['inputs'] or [None]
         test = min(cell['test'], len(inputs))
-        self._write_to_stdout('[строка {} программы, тест {}]\n'.format(number, test))
-        if self._without_comments(statements).strip():
-            source = self._with_definitions(self._paste(program['code'], statements, number), program['code'], code)
-        else:  # only expressions: nothing is pasted, gdb just stops at the line
+        if any(self._without_comments(group['statements']).strip() for group in groups):
+            source = self._with_definitions(self._paste(program['code'], groups), program['code'], code)
+        else:  # only expressions: nothing is pasted, gdb just stops at the lines
             source = self._with_definitions(program['code'])
-        run = dict(program['cell'], out='snippet', time=False)
-        if expressions:
+        if any(group['expressions'] for group in groups):
+            run = dict(program['cell'], time=False)
             self._build_executable(run, source, '-w')
-            self._show_values(run, expressions, number, inputs[test - 1])
+            self._show_values(run, groups, test, inputs[test - 1])
         else:
+            run = dict(program['cell'], out='snippet', time=False,
+                       format=lambda data: self._format_groups(groups, test, self._split_snippet(data)))
             self._build_library(run, source, '-O0')
             self._run(run, inputs[test - 1], allow_stdin)
 
@@ -572,7 +606,7 @@ class CKernel(Kernel):
         if not re.search(r'\bmain\s*\(', self._without_comments(code)):
             key = self.get_parent().get('metadata', {}).get('cellId') or code
             self.definitions.pop(key, None)  # the cell is run again: its old definitions are replaced
-            if cell['line'] is None and self._is_definitions(code):
+            if not cell['lines'] and self._is_definitions(code):
                 self.definitions[key] = code
                 self._write_to_stdout('[определения запомнены, они будут во всех следующих программах]\n')
             else:
