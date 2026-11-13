@@ -11,6 +11,8 @@ Added on top of it:
   - /*%gdb ... */ block: run the cell under the gdb debugger;
   - a cell without main() that only defines things (functions, structs, globals, #include)
     is remembered and added to every later program, like a def cell in a Python notebook;
+  - a program that calls a function it does not define takes it from an earlier cell with main()
+    (everything of that cell except main), like names from earlier cells in Python;
   - any other cell without main() is a debug cell: it works inside the last program before
     line //%line: N (default: the end of main); one cell may have several //%line parts.
     Statements are pasted into the program and run, lines that are bare expressions
@@ -101,7 +103,7 @@ class CellFailed(Exception):
 
 class CKernel(Kernel):
     implementation = 'c_interactive_kernel'
-    implementation_version = '3.2'
+    implementation_version = '3.3'
     language = 'c'
     language_version = 'C17'
     language_info = {'name': 'c',
@@ -116,6 +118,8 @@ class CKernel(Kernel):
         subprocess.call(['gcc', os.path.join(RESOURCES, 'master.c'), '-std=c11', '-rdynamic', '-ldl', '-o', self.master_path])
         self.program = None  # the last cell with main(): its code and parsed settings, for debug cells
         self.definitions = {}  # cell id -> code of a cell with definitions only, added to every later program
+        self.history = {}  # cell id -> code of a cell with main(), main blanked out: functions for later cells
+        self.borrowed = None  # the part of history the current program needs, or None
 
     def do_shutdown(self, restart):
         shutil.rmtree(self.work, ignore_errors=True)
@@ -315,11 +319,15 @@ class CKernel(Kernel):
 
     # ---------- building the source ----------
 
-    def _with_definitions(self, code, original=None, snippet=None):
+    def _with_definitions(self, code, original=None, snippet=None, borrowed='program'):
         """Cells with definitions go before the program; #line keeps the cell's own line numbers.
         Each part is also saved under its own name, so gcc and gdb quote the lines the user sees"""
         parts = []
         self.files = {'cell.c': code if original is None else original}
+        borrowed = self.borrowed if borrowed == 'program' else borrowed
+        if borrowed is not None:
+            parts += ['#line 1 "defs_earlier.c"', borrowed]
+            self.files['defs_earlier.c'] = borrowed
         for number, definition in enumerate(self.definitions.values()):
             parts += ['#line 1 "defs{}.c"'.format(number + 1), definition]
             self.files['defs{}.c'.format(number + 1)] = definition
@@ -589,9 +597,47 @@ class CKernel(Kernel):
             self._build_library(run, source, '-O0')
             self._run(run, inputs[test - 1], allow_stdin)
 
+    def _without_main(self, code):
+        """The cell with main() blanked out (line breaks stay): its functions, structs and globals"""
+        clean = self._without_comments(code)
+        start = re.search(r'(^|\n)[ \t]*(int|void)\s+main\s*\([^)]*\)\s*\{', clean)
+        if start is None:
+            return code
+        depth, end = 0, len(code)
+        for index in range(start.end() - 1, len(clean)):
+            depth += {'{': 1, '}': -1}.get(clean[index], 0)
+            if depth == 0:
+                end = index + 1
+                break
+        return code[:start.start()] + re.sub(r'[^\n]', ' ', code[start.start():end]) + code[end:]
+
+    def _borrow(self, code, key):
+        """If the program calls functions it does not define, find an earlier cell with them"""
+        def check(borrowed):
+            return subprocess.run(['gcc', '-fsyntax-only', '-Werror=implicit-function-declaration', '-x', 'c', '-'],
+                                  input=self._with_definitions(code, borrowed=borrowed).encode(), cwd=self.work,
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, env=dict(os.environ, LC_ALL='C'))
+        alone = check(None)
+        if alone.returncode == 0:
+            return None
+        errors = alone.stderr.decode('utf-8', 'replace')
+        missing = re.findall(r"implicit declaration of function [\u2018'`](\w+)", errors) + \
+            re.findall(r"[\u2018'`](\w+)[\u2019'] undeclared", errors)
+        standard = set(re.findall(r"provide a declaration of [\u2018'`](\w+)", errors))  # printf without #include and so on
+        missing = [name for name in dict.fromkeys(missing) if name not in standard]
+        if not missing:
+            return None
+        for earlier in reversed([other for other in self.history if other != key]):
+            if check(self.history[earlier]).returncode == 0:
+                self._write_to_stdout('[из ранее запущенной ячейки взято: {}]\n'.format(', '.join(missing)))
+                return self.history[earlier]
+        self._write_to_stderr('[C kernel] не найдено: {} — нет ни в этой ячейке, ни в ячейках, запущенных раньше; '
+                              'запустите ячейку, где это написано\n'.format(', '.join(missing)))
+        raise CellFailed('не найдено: ' + ', '.join(missing))
+
     def _is_definitions(self, code):
         """True if the cell compiles on its own as a file of definitions: functions, structs, globals"""
-        result = subprocess.run(['gcc', '-fsyntax-only', '-w', '-x', 'c', '-'], input=self._with_definitions(code).encode(),
+        result = subprocess.run(['gcc', '-fsyntax-only', '-w', '-x', 'c', '-'], input=self._with_definitions(code, borrowed=None).encode(),
                                 cwd=self.work, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return result.returncode == 0
 
@@ -691,6 +737,10 @@ class CKernel(Kernel):
                 self._debug_cell(code, cell, allow_stdin)
             return
 
+        key = self.get_parent().get('metadata', {}).get('cellId') or code
+        self.borrowed = self._borrow(code, key)
+        self.history.pop(key, None)  # the newest cells are looked at first
+        self.history[key] = self._without_main(code)
         self.program = {'code': code, 'cell': cell}
         if cell['debug'] is not None:
             self._vscode_debug(cell, code)
